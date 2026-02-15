@@ -6,7 +6,7 @@ import "context"
 // be broadcasted on the server network.
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-transaction-broadcast
 func (s *Client) BroadcastTransaction(ctx context.Context, rawTx string) (string, error) {
-	resp := &basicResp{}
+	resp := &BasicResp{}
 	err := s.request(ctx, "blockchain.transaction.broadcast", []interface{}{rawTx}, &resp)
 	if err != nil {
 		return "", err
@@ -83,7 +83,7 @@ func (s *Client) GetTransaction(ctx context.Context, txHash string) (*GetTransac
 // GetRawTransaction gets a raw encoded transaction.
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-transaction-get
 func (s *Client) GetRawTransaction(ctx context.Context, txHash string) (string, error) {
-	var resp basicResp
+	var resp BasicResp
 
 	err := s.request(ctx, "blockchain.transaction.get", []interface{}{txHash, false}, &resp)
 	if err != nil {
@@ -121,7 +121,7 @@ func (s *Client) GetMerkleProof(ctx context.Context, txHash string, height uint3
 // GetHashFromPosition returns the transaction hash for a specific position in a block.
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-transaction-id-from-pos
 func (s *Client) GetHashFromPosition(ctx context.Context, height, position uint32) (string, error) {
-	var resp basicResp
+	var resp BasicResp
 
 	err := s.request(ctx, "blockchain.transaction.id_from_pos", []interface{}{height, position, false}, &resp)
 	if err != nil {

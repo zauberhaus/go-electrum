@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+
+	"github.com/zauberhaus/logger"
 )
 
 // SubscribeHeadersResp represent the response to SubscribeHeaders().
@@ -26,6 +28,8 @@ type SubscribeHeadersResult struct {
 // SubscribeHeaders subscribes to receive block headers notifications when new blocks are found.
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-headers-subscribe
 func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeadersResult, error) {
+	log := logger.GetLogger(ctx)
+
 	var resp SubscribeHeadersResp
 
 	err := s.request(ctx, "blockchain.headers.subscribe", []interface{}{}, &resp)
@@ -33,7 +37,7 @@ func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeaders
 		return nil, err
 	}
 
-	respChan := make(chan *SubscribeHeadersResult, 1)
+	respChan := make(chan *SubscribeHeadersResult, 100)
 	respChan <- resp.Result
 
 	go func() {
@@ -46,6 +50,7 @@ func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeaders
 
 			err := json.Unmarshal(msg.content, &resp)
 			if err != nil {
+				log.Warnf("Unmarshaling of SubscribeHeaders failed: %v", err)
 				return
 			}
 
@@ -69,6 +74,10 @@ type ScripthashSubscription struct {
 	lock sync.RWMutex
 }
 
+func (s *ScripthashSubscription) SH() []string {
+	return s.subscribedSH
+}
+
 // SubscribeNotif represent the notification to SubscribeScripthash() and SubscribeMasternode().
 type SubscribeNotif struct {
 	Params [2]string `json:"params"`
@@ -78,7 +87,7 @@ type SubscribeNotif struct {
 func (s *Client) SubscribeScripthash() (*ScripthashSubscription, <-chan *SubscribeNotif) {
 	sub := &ScripthashSubscription{
 		server:        s,
-		notifChan:     make(chan *SubscribeNotif, 1),
+		notifChan:     make(chan *SubscribeNotif, 10),
 		scripthashMap: make(map[string]string),
 	}
 
@@ -111,7 +120,7 @@ func (s *Client) SubscribeScripthash() (*ScripthashSubscription, <-chan *Subscri
 
 // Add ...
 func (sub *ScripthashSubscription) Add(ctx context.Context, scripthash string, address ...string) error {
-	var resp basicResp
+	var resp BasicResp
 
 	err := sub.server.request(ctx, "blockchain.scripthash.subscribe", []interface{}{scripthash}, &resp)
 	if err != nil {
@@ -128,6 +137,34 @@ func (sub *ScripthashSubscription) Add(ctx context.Context, scripthash string, a
 		sub.scripthashMap[scripthash] = address[0]
 	}
 	sub.lock.Unlock()
+
+	return nil
+}
+
+// Add ...
+func (sub *ScripthashSubscription) Remove(ctx context.Context, scripthash string) error {
+	found := false
+
+	for i, v := range sub.subscribedSH {
+		if v == scripthash {
+			sub.lock.Lock()
+			sub.subscribedSH = append(sub.subscribedSH[:i], sub.subscribedSH[i+1:]...)
+			sub.lock.Unlock()
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return errors.New("scripthash not found")
+	}
+
+	var resp BasicResp
+
+	err := sub.server.request(ctx, "blockchain.scripthash.unsubscribe", []interface{}{scripthash}, &resp)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -166,20 +203,6 @@ func (sub *ScripthashSubscription) GetChannel() <-chan *SubscribeNotif {
 	return sub.notifChan
 }
 
-// Remove ...
-func (sub *ScripthashSubscription) Remove(scripthash string) error {
-	for i, v := range sub.subscribedSH {
-		if v == scripthash {
-			sub.lock.Lock()
-			sub.subscribedSH = append(sub.subscribedSH[:i], sub.subscribedSH[i+1:]...)
-			sub.lock.Unlock()
-			return nil
-		}
-	}
-
-	return errors.New("scripthash not found")
-}
-
 // RemoveAddress ...
 func (sub *ScripthashSubscription) RemoveAddress(address string) error {
 	scripthash, err := sub.GetScripthash(address)
@@ -215,7 +238,7 @@ func (sub *ScripthashSubscription) Resubscribe(ctx context.Context) error {
 // SubscribeMasternode subscribes to receive notifications when a masternode status changes.
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-headers-subscribe
 func (s *Client) SubscribeMasternode(ctx context.Context, collateral string) (<-chan string, error) {
-	var resp basicResp
+	var resp BasicResp
 
 	err := s.request(ctx, "blockchain.masternode.subscribe", []interface{}{collateral}, &resp)
 	if err != nil {

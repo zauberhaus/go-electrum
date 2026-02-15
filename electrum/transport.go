@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"log"
 	"net"
-	"time"
+
+	"github.com/zauberhaus/logger"
 )
 
 // TCPTransport store information about the TCP transport.
@@ -14,10 +14,14 @@ type TCPTransport struct {
 	conn      net.Conn
 	responses chan []byte
 	errors    chan error
+
+	log logger.Logger
 }
 
 // NewTCPTransport opens a new TCP connection to the remote server.
 func NewTCPTransport(ctx context.Context, addr string) (*TCPTransport, error) {
+	log := logger.GetLogger(ctx)
+
 	var d net.Dialer
 
 	conn, err := d.DialContext(ctx, "tcp", addr)
@@ -29,6 +33,7 @@ func NewTCPTransport(ctx context.Context, addr string) (*TCPTransport, error) {
 		conn:      conn,
 		responses: make(chan []byte),
 		errors:    make(chan error),
+		log:       log,
 	}
 
 	go tcp.listen()
@@ -38,6 +43,8 @@ func NewTCPTransport(ctx context.Context, addr string) (*TCPTransport, error) {
 
 // NewSSLTransport opens a new SSL connection to the remote server.
 func NewSSLTransport(ctx context.Context, addr string, config *tls.Config) (*TCPTransport, error) {
+	log := logger.GetLogger(ctx)
+
 	dialer := tls.Dialer{
 		NetDialer: &net.Dialer{},
 		Config:    config,
@@ -51,6 +58,7 @@ func NewSSLTransport(ctx context.Context, addr string, config *tls.Config) (*TCP
 		conn:      conn,
 		responses: make(chan []byte),
 		errors:    make(chan error),
+		log:       log,
 	}
 
 	go tcp.listen()
@@ -68,9 +76,7 @@ func (t *TCPTransport) listen() {
 			t.errors <- err
 			break
 		}
-		if DebugMode {
-			log.Printf("%s [debug] %s -> %s", time.Now().Format("2006-01-02 15:04:05"), t.conn.RemoteAddr(), line)
-		}
+		t.log.Debugf("%s -> %s", t.conn.RemoteAddr(), line)
 
 		t.responses <- line
 	}
@@ -78,9 +84,7 @@ func (t *TCPTransport) listen() {
 
 // SendMessage sends a message to the remote server through the TCP transport.
 func (t *TCPTransport) SendMessage(body []byte) error {
-	if DebugMode {
-		log.Printf("%s [debug] %s <- %s", time.Now().Format("2006-01-02 15:04:05"), t.conn.RemoteAddr(), body)
-	}
+	t.log.Debugf("%s <- %s", t.conn.RemoteAddr(), body)
 
 	_, err := t.conn.Write(body)
 	return err

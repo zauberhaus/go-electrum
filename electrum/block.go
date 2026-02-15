@@ -36,7 +36,7 @@ func (s *Client) GetBlockHeader(ctx context.Context, height uint32, checkpointHe
 		return resp.Result, err
 	}
 
-	var resp basicResp
+	var resp BasicResp
 	err := s.request(ctx, "blockchain.block.header", []interface{}{height, 0}, &resp)
 	if err != nil {
 		return nil, err

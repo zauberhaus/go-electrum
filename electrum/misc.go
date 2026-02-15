@@ -2,7 +2,7 @@ package electrum
 
 import "context"
 
-type basicResp struct {
+type BasicResp struct {
 	Result string `json:"result"`
 }
 
@@ -40,7 +40,7 @@ func (s *Client) GetRelayFee(ctx context.Context) (float32, error) {
 }
 
 // GetFeeHistogramResp represents the response to GetFee().
-type getFeeHistogramResp struct {
+type GetFeeHistogramResp struct {
 	Result [][2]uint64 `json:"result"`
 }
 
@@ -48,7 +48,7 @@ type getFeeHistogramResp struct {
 // memory pool, weighted by transacation size.
 // https://electrumx.readthedocs.io/en/latest/protocol-methods.html#mempool-get-fee-histogram
 func (s *Client) GetFeeHistogram(ctx context.Context) (map[uint32]uint64, error) {
-	var resp getFeeHistogramResp
+	var resp GetFeeHistogramResp
 
 	err := s.request(ctx, "mempool.get_fee_histogram", []interface{}{}, &resp)
 	if err != nil {

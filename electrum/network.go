@@ -1,3 +1,5 @@
+//go:generate go run go.uber.org/mock/mockgen@latest -typed -destination=network_mock.go -package=electrum -source=./network.go
+
 package electrum
 
 import (
@@ -6,9 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/zauberhaus/logger"
 )
 
 const (
@@ -22,9 +25,6 @@ const (
 )
 
 var (
-	// DebugMode provides debug output on communications with the remote server if enabled.
-	DebugMode bool
-
 	// ErrServerConnected throws an error if remote server is already connected.
 	ErrServerConnected = errors.New("server is already connected")
 
@@ -56,18 +56,34 @@ type container struct {
 
 // Client stores information about the remote server.
 type Client struct {
-	transport Transport
+	transport    *Atomic[Transport]
+	handlers     *Atomic[map[uint64]chan *container]
+	pushHandlers *Atomic[map[string][]chan *container]
 
-	handlers     map[uint64]chan *container
-	handlersLock sync.RWMutex
-
-	pushHandlers     map[string][]chan *container
-	pushHandlersLock sync.RWMutex
-
-	Error chan error
-	quit  chan struct{}
+	errorChan chan error
+	quit      chan struct{}
 
 	nextID uint64
+
+	log logger.Logger
+}
+
+func NewClient(ctx context.Context, transport Transport) *Client {
+	log := logger.GetLogger(ctx)
+
+	c := &Client{
+		handlers:     MakeAtomic(make(map[uint64]chan *container)),
+		pushHandlers: MakeAtomic(make(map[string][]chan *container)),
+
+		errorChan: make(chan error),
+		quit:      make(chan struct{}),
+		log:       log,
+	}
+
+	c.transport = MakeAtomic[Transport](transport)
+	go c.listen()
+
+	return c
 }
 
 // NewClientTCP initialize a new client for remote server and connects to the remote server using TCP
@@ -77,18 +93,7 @@ func NewClientTCP(ctx context.Context, addr string) (*Client, error) {
 		return nil, err
 	}
 
-	c := &Client{
-		handlers:     make(map[uint64]chan *container),
-		pushHandlers: make(map[string][]chan *container),
-
-		Error: make(chan error),
-		quit:  make(chan struct{}),
-	}
-
-	c.transport = transport
-	go c.listen()
-
-	return c, nil
+	return NewClient(ctx, transport), nil
 }
 
 // NewClientSSL initialize a new client for remote server and connects to the remote server using SSL
@@ -98,18 +103,7 @@ func NewClientSSL(ctx context.Context, addr string, config *tls.Config) (*Client
 		return nil, err
 	}
 
-	c := &Client{
-		handlers:     make(map[uint64]chan *container),
-		pushHandlers: make(map[string][]chan *container),
-
-		Error: make(chan error),
-		quit:  make(chan struct{}),
-	}
-
-	c.transport = transport
-	go c.listen()
-
-	return c, nil
+	return NewClient(ctx, transport), nil
 }
 
 type apiErr struct {
@@ -137,20 +131,52 @@ type response struct {
 }
 
 func (s *Client) listen() {
+	errors := func() <-chan error {
+		ch, _ := s.transport.Get(func(val Transport) (any, bool) {
+			return val.Errors(), true
+		})
+
+		if ch == nil {
+			return nil
+		}
+
+		if ch, ok := ch.(<-chan error); ok {
+			return ch
+		}
+
+		return nil
+	}
+
+	responses := func() <-chan []byte {
+		ch, _ := s.transport.Get(func(val Transport) (any, bool) {
+			return val.Responses(), true
+		})
+
+		if ch == nil {
+			return nil
+		}
+
+		if ch, ok := ch.(<-chan []byte); ok {
+			return ch
+		}
+
+		return nil
+	}
+
 	for {
 		if s.IsShutdown() {
 			break
 		}
-		if s.transport == nil {
+		if s.transport.IsNilOrZero() {
 			break
 		}
 		select {
 		case <-s.quit:
 			return
-		case err := <-s.transport.Errors():
-			s.Error <- err
+		case err := <-errors():
+			s.errorChan <- err
 			s.Shutdown()
-		case bytes := <-s.transport.Responses():
+		case bytes := <-responses():
 			result := &container{
 				content: bytes,
 			}
@@ -158,34 +184,41 @@ func (s *Client) listen() {
 			msg := &response{}
 			err := json.Unmarshal(bytes, msg)
 			if err != nil {
-				if DebugMode {
-					log.Printf("Unmarshal received message failed: %v", err)
-				}
+				s.log.Errorf("Unmarshal received message failed: %v", err)
 				result.err = fmt.Errorf("unmarshal received message failed: %v", err)
 			} else if msg.Error != nil {
 				result.err = msg.Error
 			}
 
 			if len(msg.Method) > 0 {
-				s.pushHandlersLock.RLock()
-				handlers := s.pushHandlers[msg.Method]
-				s.pushHandlersLock.RUnlock()
+				handlers, ok := Get(s.pushHandlers, func(val map[string][]chan *container) ([]chan *container, bool) {
+					handlers, ok := val[msg.Method]
+					return handlers, ok
+				})
 
-				for _, handler := range handlers {
-					select {
-					case handler <- result:
-					default:
+				if ok {
+					for _, handler := range handlers {
+						handler <- result
 					}
+				} else {
+					s.log.Warnf("Unknown notification: %s -> %s", msg.Method, result.content)
 				}
-			}
+			} else {
+				c, ok := Get(s.handlers, func(val map[uint64]chan *container) (chan *container, bool) {
+					c, ok := val[msg.ID]
 
-			s.handlersLock.RLock()
-			c, ok := s.handlers[msg.ID]
-			s.handlersLock.RUnlock()
+					if c == nil {
+						return nil, false
+					}
 
-			if ok {
-				// TODO: very rare case. fix this memory leak, when nobody will read channel (in case of error)
-				c <- result
+					return c, ok
+				})
+
+				if ok {
+					c <- result
+				} else {
+					s.log.Warnf("Unexpected container: %v -> %s", msg.ID, result.content)
+				}
 			}
 		}
 	}
@@ -193,20 +226,24 @@ func (s *Client) listen() {
 
 func (s *Client) listenPush(method string) <-chan *container {
 	c := make(chan *container, 1)
-	s.pushHandlersLock.Lock()
-	s.pushHandlers[method] = append(s.pushHandlers[method], c)
-	s.pushHandlersLock.Unlock()
+	s.pushHandlers.Change(func(val map[string][]chan *container) (map[string][]chan *container, error) {
+		val[method] = append(val[method], c)
+		return val, nil
+	})
 
 	return c
 }
 
 type request struct {
-	ID     uint64        `json:"id"`
-	Method string        `json:"method"`
-	Params []interface{} `json:"params"`
+	ID     uint64 `json:"id"`
+	Method string `json:"method"`
+	Params []any  `json:"params"`
 }
 
-func (s *Client) request(ctx context.Context, method string, params []interface{}, v interface{}) error {
+func (s *Client) request(ctx context.Context, method string, params []any, v any) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	select {
 	case <-s.quit:
 		return ErrServerShutdown
@@ -226,7 +263,10 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 
 	bytes = append(bytes, nl)
 
-	err = s.transport.SendMessage(bytes)
+	err = s.transport.Do(func(val Transport) error {
+		return val.SendMessage(bytes)
+	})
+
 	if err != nil {
 		s.Shutdown()
 		return err
@@ -234,21 +274,35 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 
 	c := make(chan *container, 1)
 
-	s.handlersLock.Lock()
-	s.handlers[msg.ID] = c
-	s.handlersLock.Unlock()
+	err = s.handlers.Change(func(val map[uint64]chan *container) (map[uint64]chan *container, error) {
+		if s.IsShutdown() {
+			return val, ErrServerShutdown
+		}
+
+		if val == nil {
+			val = make(map[uint64]chan *container)
+		}
+
+		val[msg.ID] = c
+		return val, nil
+	})
+
+	if err != nil {
+		return err
+	}
 
 	defer func() {
-		s.handlersLock.Lock()
-		delete(s.handlers, msg.ID)
-		s.handlersLock.Unlock()
+		s.handlers.Change(func(val map[uint64]chan *container) (map[uint64]chan *container, error) {
+			delete(val, msg.ID)
+			return nil, nil
+		})
 	}()
 
 	var resp *container
 	select {
 	case resp = <-c:
 	case <-ctx.Done():
-		return ErrTimeout
+		return ctx.Err()
 	}
 
 	if resp.err != nil {
@@ -266,15 +320,20 @@ func (s *Client) request(ctx context.Context, method string, params []interface{
 }
 
 func (s *Client) Shutdown() {
-	if !s.IsShutdown() {
-		close(s.quit)
-	}
-	if s.transport != nil {
-		_ = s.transport.Close()
-	}
-	s.transport = nil
-	s.handlers = nil
-	s.pushHandlers = nil
+
+	close(s.quit)
+
+	s.transport.Do(func(val Transport) error {
+		if val != nil {
+			val.Close()
+		}
+
+		return nil
+	})
+
+	s.transport.Reset()
+	s.handlers.Reset()
+	s.pushHandlers.Reset()
 }
 
 func (s *Client) IsShutdown() bool {
