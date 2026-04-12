@@ -41,21 +41,27 @@ func (s *Client) SubscribeHeaders(ctx context.Context) (<-chan *SubscribeHeaders
 	respChan <- resp.Result
 
 	go func() {
-		for msg := range s.listenPush("blockchain.headers.subscribe") {
-			if msg.err != nil {
+		ch := s.listenPush("blockchain.headers.subscribe")
+		for {
+			select {
+			case <-s.quit:
 				return
-			}
+			case msg, ok := <-ch:
+				if !ok || msg.err != nil {
+					return
+				}
 
-			var resp SubscribeHeadersNotif
+				var resp SubscribeHeadersNotif
 
-			err := json.Unmarshal(msg.content, &resp)
-			if err != nil {
-				log.Warnf("Unmarshaling of SubscribeHeaders failed: %v", err)
-				return
-			}
+				err := json.Unmarshal(msg.content, &resp)
+				if err != nil {
+					log.Warnf("Unmarshaling of SubscribeHeaders failed: %v", err)
+					return
+				}
 
-			for _, param := range resp.Params {
-				respChan <- param
+				for _, param := range resp.Params {
+					respChan <- param
+				}
 			}
 		}
 	}()
@@ -74,8 +80,13 @@ type ScripthashSubscription struct {
 	lock sync.RWMutex
 }
 
+// SH returns a snapshot of the currently subscribed scripthashes.
 func (s *ScripthashSubscription) SH() []string {
-	return s.subscribedSH
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	result := make([]string, len(s.subscribedSH))
+	copy(result, s.subscribedSH)
+	return result
 }
 
 // SubscribeNotif represent the notification to SubscribeScripthash() and SubscribeMasternode().
@@ -92,26 +103,40 @@ func (s *Client) SubscribeScripthash() (*ScripthashSubscription, <-chan *Subscri
 	}
 
 	go func() {
-		for msg := range s.listenPush("blockchain.scripthash.subscribe") {
-			if msg.err != nil {
+		ch := s.listenPush("blockchain.scripthash.subscribe")
+		for {
+			select {
+			case <-s.quit:
 				return
-			}
+			case msg, ok := <-ch:
+				if !ok || msg.err != nil {
+					return
+				}
 
-			var resp SubscribeNotif
+				var resp SubscribeNotif
 
-			err := json.Unmarshal(msg.content, &resp)
-			if err != nil {
-				return
-			}
+				err := json.Unmarshal(msg.content, &resp)
+				if err != nil {
+					return
+				}
 
-			sub.lock.Lock()
-			for _, a := range sub.subscribedSH {
-				if a == resp.Params[0] {
+				// Check membership under RLock, then release before sending to
+				// notifChan to avoid deadlock when the channel is full and the
+				// consumer is waiting on sub.lock (e.g. inside Remove).
+				sub.lock.RLock()
+				found := false
+				for _, a := range sub.subscribedSH {
+					if a == resp.Params[0] {
+						found = true
+						break
+					}
+				}
+				sub.lock.RUnlock()
+
+				if found {
 					sub.notifChan <- &resp
-					break
 				}
 			}
-			sub.lock.Unlock()
 		}
 	}()
 
@@ -141,19 +166,18 @@ func (sub *ScripthashSubscription) Add(ctx context.Context, scripthash string, a
 	return nil
 }
 
-// Add ...
+// Remove ...
 func (sub *ScripthashSubscription) Remove(ctx context.Context, scripthash string) error {
+	sub.lock.Lock()
 	found := false
-
 	for i, v := range sub.subscribedSH {
 		if v == scripthash {
-			sub.lock.Lock()
 			sub.subscribedSH = append(sub.subscribedSH[:i], sub.subscribedSH[i+1:]...)
-			sub.lock.Unlock()
 			found = true
 			break
 		}
 	}
+	sub.lock.Unlock()
 
 	if !found {
 		return errors.New("scripthash not found")
@@ -171,6 +195,9 @@ func (sub *ScripthashSubscription) Remove(ctx context.Context, scripthash string
 
 // GetAddress ...
 func (sub *ScripthashSubscription) GetAddress(scripthash string) (string, error) {
+	sub.lock.RLock()
+	defer sub.lock.RUnlock()
+
 	address, ok := sub.scripthashMap[scripthash]
 	if ok {
 		return address, nil
@@ -181,18 +208,13 @@ func (sub *ScripthashSubscription) GetAddress(scripthash string) (string, error)
 
 // GetScripthash ...
 func (sub *ScripthashSubscription) GetScripthash(address string) (string, error) {
-	var found bool
-	var scripthash string
+	sub.lock.RLock()
+	defer sub.lock.RUnlock()
 
 	for k, v := range sub.scripthashMap {
 		if v == address {
-			scripthash = k
-			found = true
+			return k, nil
 		}
-	}
-
-	if found {
-		return scripthash, nil
 	}
 
 	return "", errors.New("address not found in map")
@@ -205,17 +227,25 @@ func (sub *ScripthashSubscription) GetChannel() <-chan *SubscribeNotif {
 
 // RemoveAddress ...
 func (sub *ScripthashSubscription) RemoveAddress(address string) error {
-	scripthash, err := sub.GetScripthash(address)
-	if err != nil {
-		return err
+	sub.lock.Lock()
+	defer sub.lock.Unlock()
+
+	var scripthash string
+	for k, v := range sub.scripthashMap {
+		if v == address {
+			scripthash = k
+			break
+		}
+	}
+
+	if scripthash == "" {
+		return errors.New("address not found")
 	}
 
 	for i, v := range sub.subscribedSH {
 		if v == scripthash {
-			sub.lock.Lock()
 			sub.subscribedSH = append(sub.subscribedSH[:i], sub.subscribedSH[i+1:]...)
 			delete(sub.scripthashMap, scripthash)
-			sub.lock.Unlock()
 			return nil
 		}
 	}
@@ -225,7 +255,12 @@ func (sub *ScripthashSubscription) RemoveAddress(address string) error {
 
 // Resubscribe ...
 func (sub *ScripthashSubscription) Resubscribe(ctx context.Context) error {
-	for _, v := range sub.subscribedSH {
+	sub.lock.RLock()
+	snapshot := make([]string, len(sub.subscribedSH))
+	copy(snapshot, sub.subscribedSH)
+	sub.lock.RUnlock()
+
+	for _, v := range snapshot {
 		err := sub.Add(ctx, v)
 		if err != nil {
 			return err
@@ -251,20 +286,26 @@ func (s *Client) SubscribeMasternode(ctx context.Context, collateral string) (<-
 	}
 
 	go func() {
-		for msg := range s.listenPush("blockchain.masternode.subscribe") {
-			if msg.err != nil {
+		ch := s.listenPush("blockchain.masternode.subscribe")
+		for {
+			select {
+			case <-s.quit:
 				return
-			}
+			case msg, ok := <-ch:
+				if !ok || msg.err != nil {
+					return
+				}
 
-			var resp SubscribeNotif
+				var resp SubscribeNotif
 
-			err := json.Unmarshal(msg.content, &resp)
-			if err != nil {
-				return
-			}
+				err := json.Unmarshal(msg.content, &resp)
+				if err != nil {
+					return
+				}
 
-			for _, param := range resp.Params {
-				respChan <- param
+				for _, param := range resp.Params {
+					respChan <- param
+				}
 			}
 		}
 	}()

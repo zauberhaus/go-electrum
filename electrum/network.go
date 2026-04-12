@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,8 +61,8 @@ type Client struct {
 	handlers     *Atomic[map[uint64]chan *container]
 	pushHandlers *Atomic[map[string][]chan *container]
 
-	errorChan chan error
-	quit      chan struct{}
+	quit     chan struct{}
+	shutdown sync.Once
 
 	nextID uint64
 
@@ -75,8 +76,7 @@ func NewClient(ctx context.Context, transport Transport) *Client {
 		handlers:     MakeAtomic(make(map[uint64]chan *container)),
 		pushHandlers: MakeAtomic(make(map[string][]chan *container)),
 
-		errorChan: make(chan error),
-		quit:      make(chan struct{}),
+		quit: make(chan struct{}),
 		log:       log,
 	}
 
@@ -173,8 +173,7 @@ func (s *Client) listen() {
 		select {
 		case <-s.quit:
 			return
-		case err := <-errors():
-			s.errorChan <- err
+		case <-errors():
 			s.Shutdown()
 		case bytes := <-responses():
 			result := &container{
@@ -227,6 +226,9 @@ func (s *Client) listen() {
 func (s *Client) listenPush(method string) <-chan *container {
 	c := make(chan *container, 1)
 	s.pushHandlers.Change(func(val map[string][]chan *container) (map[string][]chan *container, error) {
+		if val == nil {
+			val = make(map[string][]chan *container)
+		}
 		val[method] = append(val[method], c)
 		return val, nil
 	})
@@ -263,15 +265,6 @@ func (s *Client) request(ctx context.Context, method string, params []any, v any
 
 	bytes = append(bytes, nl)
 
-	err = s.transport.Do(func(val Transport) error {
-		return val.SendMessage(bytes)
-	})
-
-	if err != nil {
-		s.Shutdown()
-		return err
-	}
-
 	c := make(chan *container, 1)
 
 	err = s.handlers.Change(func(val map[uint64]chan *container) (map[uint64]chan *container, error) {
@@ -291,10 +284,23 @@ func (s *Client) request(ctx context.Context, method string, params []any, v any
 		return err
 	}
 
+	err = s.transport.Do(func(val Transport) error {
+		return val.SendMessage(bytes)
+	})
+
+	if err != nil {
+		s.handlers.Change(func(val map[uint64]chan *container) (map[uint64]chan *container, error) {
+			delete(val, msg.ID)
+			return val, nil
+		})
+		s.Shutdown()
+		return err
+	}
+
 	defer func() {
 		s.handlers.Change(func(val map[uint64]chan *container) (map[uint64]chan *container, error) {
 			delete(val, msg.ID)
-			return nil, nil
+			return val, nil
 		})
 	}()
 
@@ -320,20 +326,21 @@ func (s *Client) request(ctx context.Context, method string, params []any, v any
 }
 
 func (s *Client) Shutdown() {
+	s.shutdown.Do(func() {
+		close(s.quit)
 
-	close(s.quit)
+		s.transport.Do(func(val Transport) error {
+			if val != nil {
+				val.Close()
+			}
 
-	s.transport.Do(func(val Transport) error {
-		if val != nil {
-			val.Close()
-		}
+			return nil
+		})
 
-		return nil
+		s.transport.Reset()
+		s.handlers.Reset()
+		s.pushHandlers.Reset()
 	})
-
-	s.transport.Reset()
-	s.handlers.Reset()
-	s.pushHandlers.Reset()
 }
 
 func (s *Client) IsShutdown() bool {
