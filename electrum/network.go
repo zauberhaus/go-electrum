@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/zauberhaus/logger"
 )
@@ -77,7 +76,7 @@ func NewClient(ctx context.Context, transport Transport) *Client {
 		pushHandlers: MakeAtomic(make(map[string][]chan *container)),
 
 		quit: make(chan struct{}),
-		log:       log,
+		log:  log,
 	}
 
 	c.transport = MakeAtomic[Transport](transport)
@@ -243,9 +242,6 @@ type request struct {
 }
 
 func (s *Client) request(ctx context.Context, method string, params []any, v any) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	select {
 	case <-s.quit:
 		return ErrServerShutdown
