@@ -3,6 +3,7 @@
 package electrum
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -117,6 +118,24 @@ func (e *apiErr) Error() string {
 type APIError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// UnmarshalJSON accepts both forms of the JSON-RPC "error" field returned by
+// ElectrumX servers: the standard {"code":N,"message":"..."} object and a bare
+// string (e.g. "Too many history entries"), which some servers send instead.
+func (A *APIError) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var msg string
+		if err := json.Unmarshal(trimmed, &msg); err != nil {
+			return err
+		}
+		A.Message = msg
+		return nil
+	}
+
+	type alias APIError
+	return json.Unmarshal(data, (*alias)(A))
 }
 
 func (A APIError) Error() string {
